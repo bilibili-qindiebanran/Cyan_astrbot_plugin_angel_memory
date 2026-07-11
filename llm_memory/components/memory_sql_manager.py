@@ -34,6 +34,7 @@ class MemorySqlManager:
         db_path: Path,
         decay_config: Optional[MemoryDecayConfig] = None,
         rerank_provider: Optional[Any] = None,
+        astrbot_context=None,
     ):
         self.logger = logger
         self.db_path = Path(db_path)
@@ -54,6 +55,7 @@ class MemorySqlManager:
             rerank_provider=self._rerank_provider,
         )
         self._fts_ready = False
+        self._astrbot_context = astrbot_context
 
         self._init_db()
         self._load_tag_cache()
@@ -930,6 +932,7 @@ class MemorySqlManager:
             conn.commit()
         self._sync_memory_fts_by_id_sync(memory.id)
         self.register_short_id(memory.id)
+        self._fts_rebuild_required = True
 
         return memory
 
@@ -1480,6 +1483,8 @@ class MemorySqlManager:
     async def consolidate_memories(self) -> None:
         # T0 时间衰减（T1/T2 不参与自然遗忘）
         await self.natural_decay_tier0()
+        # 自动合并相似被动记忆（在衰减删除之前）
+        await self._auto_merge_similar_passive_memories()
         deleted_ids: List[str] = []
         with self._connect() as conn:
             rows = conn.execute(
@@ -1495,6 +1500,263 @@ class MemorySqlManager:
             )
             conn.commit()
         self._sync_memory_fts_batch_sync(delete_ids=deleted_ids)
+
+    async def _auto_merge_similar_passive_memories(self) -> int:
+        """使用 BM25 + LLM 发现并合并语义相似的被动记忆。
+
+        Returns:
+            成功合并的组数。
+        """
+        if self._astrbot_context is None:
+            return 0
+
+        import time
+        from collections import defaultdict
+
+        BM25_SCORE_THRESHOLD = 0.7
+        BM25_CANDIDATE_LIMIT = 5
+        MAX_MERGE_GROUPS = 30
+        MIN_CLUSTER_SIZE = 2
+
+        t0 = time.time()
+
+        # 第一步：加载所有被动记忆
+        all_rows = self._get_all_passive_memory_rows()
+        total_passive = len(all_rows)
+        if total_passive < MIN_CLUSTER_SIZE:
+            return 0
+
+        row_by_id = {r["id"]: r for r in all_rows}
+
+        # 第二步：按 memory_scope 分组
+        scope_groups: dict = defaultdict(list)
+        for row in all_rows:
+            scope_groups[row.get("memory_scope", "public")].append(row)
+
+        self.logger.info(
+            f"[自动合并] 开始 被动记忆={total_passive}条 scope数={len(scope_groups)}"
+        )
+
+        merged_total = 0
+        total_pairs = 0
+        total_clusters = 0
+        skipped_by_llm = 0
+
+        for scope, rows in scope_groups.items():
+            scope_size = len(rows)
+            if scope_size < MIN_CLUSTER_SIZE:
+                self.logger.debug(f"[自动合并] scope={scope} 记忆数={scope_size} 不足最小聚类数，跳过")
+                continue
+
+            # 第三步：BM25 候选发现
+            pairs: set[tuple[str, str]] = set()
+            for row in rows:
+                query = str(row.get("judgment", "") or "").strip()
+                if not query:
+                    continue
+                candidates = self._search_similar_by_bm25(query, BM25_CANDIDATE_LIMIT)
+                for cand in candidates:
+                    score = float(cand.get("final_score", 0.0))
+                    if score < BM25_SCORE_THRESHOLD:
+                        continue
+                    cand_id = str(cand.get("id") or "").strip()
+                    if not cand_id or cand_id == row["id"]:
+                        continue
+                    if cand_id not in row_by_id:
+                        continue
+                    a, b = sorted([row["id"], cand_id])
+                    pairs.add((a, b))
+
+            scope_pairs = len(pairs)
+            total_pairs += scope_pairs
+
+            if not pairs:
+                self.logger.debug(
+                    f"[自动合并] scope={scope} 记忆数={scope_size} BM25候选对=0，跳过"
+                )
+                continue
+
+            # 第四步：Union-Find 聚类
+            parent = {}
+            def find(x):
+                if x not in parent:
+                    parent[x] = x
+                if parent[x] != x:
+                    parent[x] = find(parent[x])
+                return parent[x]
+            def union(x, y):
+                rx, ry = find(x), find(y)
+                if rx != ry:
+                    parent[rx] = ry
+
+            for a, b in pairs:
+                union(a, b)
+
+            groups: dict[str, list] = defaultdict(list)
+            for row in rows:
+                root = find(row["id"])
+                groups[root].append(row)
+
+            sorted_groups = sorted(groups.values(), key=len, reverse=True)
+            sorted_groups = [g for g in sorted_groups if len(g) >= MIN_CLUSTER_SIZE]
+            sorted_groups = sorted_groups[:MAX_MERGE_GROUPS]
+
+            scope_clusters = len(sorted_groups)
+            total_clusters += scope_clusters
+
+            self.logger.info(
+                f"[自动合并] scope={scope} 记忆数={scope_size} BM25候选对={scope_pairs} 聚类数={scope_clusters}"
+            )
+
+            # 第五步：逐组调用 LLM 合并
+            for cluster in sorted_groups:
+                if merged_total >= MAX_MERGE_GROUPS:
+                    break
+                cluster_size = len(cluster)
+                # 取第一条记忆的 judgment 前 40 字作为预览
+                preview = str(cluster[0].get("judgment", "") or "")[:40]
+                try:
+                    source_ids = [r["id"] for r in cluster]
+                    merged = await self._llm_merge_cluster(cluster)
+                    if merged is None:
+                        skipped_by_llm += 1
+                        self.logger.info(
+                            f"[自动合并] scope={scope} 聚类大小={cluster_size} LLM=skip 预览={preview}"
+                        )
+                        continue
+                    await self.merge_group_with_content(
+                        source_ids, merged["judgment"], merged["reasoning"], merged["tags"]
+                    )
+                    merged_total += 1
+                    self.logger.info(
+                        f"[自动合并] scope={scope} 聚类大小={cluster_size} LLM=merge → {merged['judgment'][:40]}"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"[自动合并] scope={scope} 聚类大小={cluster_size} 失败: {e} 预览={preview}",
+                        exc_info=True,
+                    )
+
+        elapsed = int((time.time() - t0) * 1000)
+        self.logger.info(
+            f"[自动合并] 完成 合并={merged_total}组 LLM跳过={skipped_by_llm} "
+            f"总候选对={total_pairs} 总聚类={total_clusters} 被动记忆={total_passive}条 耗时={elapsed}ms"
+        )
+        return merged_total
+
+    def _get_all_passive_memory_rows(self) -> list[dict]:
+        """返回所有活跃被动记忆行 (id, judgment, memory_scope)。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, judgment, memory_scope FROM memory_records "
+                "WHERE is_active = 0 AND strength > 0"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_similar_by_bm25(self, query: str, limit: int) -> list[dict]:
+        """用 Tantivy BM25 查找与 query 相似的记忆。"""
+        self._ensure_fts_ready_sync()
+        return self._fts_retriever.search_memory_bm25_only(query=query, limit=limit)
+
+    async def _llm_merge_cluster(self, cluster: list[dict]) -> dict | None:
+        """调用 LLM 判断聚类中的记忆是否应合并，以及合并后的内容。
+
+        Returns:
+            含 "judgment"、"reasoning"、"tags" 键的字典；
+            如果 LLM 决定跳过合并则返回 None。
+        """
+        import json
+
+        # 惰性查找可用 LLM provider
+        provider = None
+        try:
+            pm = self._astrbot_context.provider_manager
+            for p in pm.provider_insts:
+                if hasattr(p, "text_chat"):
+                    provider = p
+                    break
+        except Exception:
+            pass
+        if provider is None:
+            raise RuntimeError("[自动合并] 无可用 LLM provider")
+
+        memory_lines = []
+        for i, row in enumerate(cluster, 1):
+            mem = self._get_memories_by_ids_sync([row["id"]])
+            if not mem:
+                continue
+            m = mem[0]
+            tags_str = ", ".join(getattr(m, "tags", []) or [])
+            memory_lines.append(
+                f"[{i}] {getattr(m, 'judgment', '')}\n"
+                f"    tags: [{tags_str}]"
+            )
+        user_message = (
+            "请检查以下语义相似的候选记忆组，决定是否合并。\n\n"
+            + "\n\n".join(memory_lines)
+        )
+
+        system_prompt = (
+            "你是记忆整理助手。接收一组语义相似的记忆，判断是否应合并。\n\n"
+            "输出 JSON (不要输出其他内容):\n"
+            '{"action": "merge"|"skip", "judgment": "...", "reasoning": "...", "tags": [...]}\n\n'
+            "规则:\n"
+            "- 如果记忆描述的是同一事实的不同表述 → action: merge\n"
+            "- 如果记忆之间存在真实信息冲突或语义相反 → action: skip\n"
+            "- judgment: 取表述最完整、最准确的那条 (可小幅改写使其完整通顺)\n"
+            "- reasoning: 简要说明合并理由 (如\"合并了N条关于同一事实的表述\")\n"
+            "- tags: 取所有源记忆的 tags 并集并去重\n"
+        )
+
+        try:
+            response = await provider.text_chat(
+                prompt=user_message,
+                system_prompt=system_prompt,
+                temperature=0.1,
+            )
+            raw = response.completion_text
+            result = json.loads(raw)
+            if result.get("action") != "merge":
+                return None
+            judgment = str(result.get("judgment", "") or "").strip()
+            if not judgment:
+                return None
+            return {
+                "judgment": judgment,
+                "reasoning": str(result.get("reasoning", "") or "").strip()[:200],
+                "tags": list(dict.fromkeys(
+                    str(t).strip() for t in (result.get("tags") or []) if str(t).strip()
+                ))[:10],
+            }
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            self.logger.debug(f"[自动合并] LLM 返回解析失败: {e}")
+            return None
+
+    async def merge_group_with_content(
+        self,
+        source_memory_ids: list[str],
+        new_judgment: str,
+        new_reasoning: str,
+        new_tags: list[str],
+    ):
+        """使用 LLM 生成的 judgment/reasoning/tags 执行合并。
+
+        与 merge_group 的区别：后者取第一条旧记忆的文本做简单拼接，
+        本方法接受 LLM 精炼后的内容。
+        """
+        memory_data = {
+            "type": "knowledge",
+            "judgment": new_judgment,
+            "reasoning": new_reasoning,
+            "tags": new_tags,
+            "is_active": False,
+        }
+        return await asyncio.to_thread(
+            self._merge_action_sync,
+            source_memory_ids,
+            memory_data,
+            "public",
+        )
 
     def _get_memories_by_ids_sync(self, memory_ids: List[str]) -> List[BaseMemory]:
         ids = [str(mid).strip() for mid in (memory_ids or []) if str(mid).strip()]
@@ -1674,6 +1936,7 @@ class MemorySqlManager:
                 with self._lock:
                     self._tag_names = cache_snapshot
                 raise
+        self._fts_rebuild_required = True
         self._sync_memory_fts_batch_sync(
             upsert_ids=[new_memory.id],
             delete_ids=ids,

@@ -184,6 +184,7 @@ class CoreMemoryRememberTool(FunctionTool):
                             "judgment": judgment,
                             "reasoning": reasoning,
                             "tags": tags,
+                            "is_active": True,
                         },
                     }
                 ]

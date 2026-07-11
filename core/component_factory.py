@@ -460,6 +460,7 @@ class ComponentFactory:
             simple_db_path,
             decay_config=decay_config,
             rerank_provider=rerank_provider,
+            astrbot_context=self.plugin_context.get_astrbot_context(),
         )
         self.logger.info(f"✅ SQL记忆管理器创建完成: {simple_db_path}")
         return manager
