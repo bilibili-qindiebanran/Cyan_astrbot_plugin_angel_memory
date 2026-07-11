@@ -56,6 +56,7 @@ class MemorySqlManager:
         )
         self._fts_ready = False
         self._astrbot_context = astrbot_context
+        self._last_auto_merge_at = 0.0  # 上次自动合并的时间戳
 
         self._init_db()
         self._load_tag_cache()
@@ -1520,8 +1521,8 @@ class MemorySqlManager:
 
         t0 = time.time()
 
-        # 第一步：加载所有被动记忆
-        all_rows = self._get_all_passive_memory_rows()
+        # 第一步：加载被动记忆（增量或全量）
+        all_rows = self._get_all_passive_memory_rows(since=self._last_auto_merge_at)
         total_passive = len(all_rows)
         if total_passive < MIN_CLUSTER_SIZE:
             return 0
@@ -1533,8 +1534,9 @@ class MemorySqlManager:
         for row in all_rows:
             scope_groups[row.get("memory_scope", "public")].append(row)
 
+        mode = "增量" if self._last_auto_merge_at > 0 else "全量"
         self.logger.info(
-            f"[自动合并] 开始 被动记忆={total_passive}条 scope数={len(scope_groups)}"
+            f"[自动合并] 开始 ({mode}) 被动记忆={total_passive}条 scope数={len(scope_groups)}"
         )
 
         merged_total = 0
@@ -1638,19 +1640,31 @@ class MemorySqlManager:
                     )
 
         elapsed = int((time.time() - t0) * 1000)
+        self._last_auto_merge_at = time.time()
         self.logger.info(
             f"[自动合并] 完成 合并={merged_total}组 LLM跳过={skipped_by_llm} "
             f"总候选对={total_pairs} 总聚类={total_clusters} 被动记忆={total_passive}条 耗时={elapsed}ms"
         )
         return merged_total
 
-    def _get_all_passive_memory_rows(self) -> list[dict]:
-        """返回所有活跃被动记忆行 (id, judgment, memory_scope)。"""
+    def _get_all_passive_memory_rows(self, since: float = 0.0) -> list[dict]:
+        """返回活跃被动记忆行 (id, judgment, memory_scope)。
+
+        Args:
+            since: 仅返回 created_at >= since 的记忆。0 表示全量。
+        """
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id, judgment, memory_scope FROM memory_records "
-                "WHERE is_active = 0 AND strength > 0"
-            ).fetchall()
+            if since > 0:
+                rows = conn.execute(
+                    "SELECT id, judgment, memory_scope FROM memory_records "
+                    "WHERE is_active = 0 AND strength > 0 AND created_at >= ?",
+                    (since,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, judgment, memory_scope FROM memory_records "
+                    "WHERE is_active = 0 AND strength > 0"
+                ).fetchall()
         return [dict(r) for r in rows]
 
     def _search_similar_by_bm25(self, query: str, limit: int) -> list[dict]:
