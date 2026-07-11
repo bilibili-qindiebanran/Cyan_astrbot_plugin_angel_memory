@@ -1518,11 +1518,27 @@ class MemorySqlManager:
         BM25_CANDIDATE_LIMIT = 5
         MAX_MERGE_GROUPS = 30
         MIN_CLUSTER_SIZE = 2
+        MAX_CLUSTER_SIZE = 15  # 超过此大小的聚类直接跳过
 
         t0 = time.time()
 
+        # 从 maintenance_state.json 读取上次合并时间（跨重启持久化）
+        import json
+        state_path = self.db_path.parent.parent / "maintenance_state.json"
+        last_merge_at = 0.0
+        if state_path.exists():
+            try:
+                with state_path.open("r", encoding="utf-8") as f:
+                    state = json.load(f)
+                last_merge_at = float(state.get("auto_merge_last_at", 0.0))
+            except Exception:
+                pass
+
+        # 取内存时间戳和文件时间戳的最大值
+        effective_since = max(self._last_auto_merge_at, last_merge_at)
+
         # 第一步：加载被动记忆（增量或全量）
-        all_rows = self._get_all_passive_memory_rows(since=self._last_auto_merge_at)
+        all_rows = self._get_all_passive_memory_rows(since=effective_since)
         total_passive = len(all_rows)
         if total_passive < MIN_CLUSTER_SIZE:
             return 0
@@ -1534,7 +1550,7 @@ class MemorySqlManager:
         for row in all_rows:
             scope_groups[row.get("memory_scope", "public")].append(row)
 
-        mode = "增量" if self._last_auto_merge_at > 0 else "全量"
+        mode = "增量" if effective_since > 0 else "全量"
         self.logger.info(
             f"[自动合并] 开始 ({mode}) 被动记忆={total_passive}条 scope数={len(scope_groups)}"
         )
@@ -1572,6 +1588,31 @@ class MemorySqlManager:
             scope_pairs = len(pairs)
             total_pairs += scope_pairs
 
+            # 标签过滤：仅保留人物标识符交集或通用标签交集的候选对
+            if pairs:
+                all_ids_in_scope = {r["id"] for r in rows}
+                tag_cache = self._load_tags_for_memory_ids(list(all_ids_in_scope))
+                filtered_pairs: set[tuple[str, str]] = set()
+                for a, b in pairs:
+                    tags_a = tag_cache.get(a, set())
+                    tags_b = tag_cache.get(b, set())
+                    # 提取人物标识符（QQ号 或 大写hex用户hash）
+                    person_a = {t for t in tags_a if self._is_person_id(t)}
+                    person_b = {t for t in tags_b if self._is_person_id(t)}
+                    has_person = bool(person_a) or bool(person_b)
+                    if has_person:
+                        if person_a & person_b:
+                            filtered_pairs.add((a, b))
+                    else:
+                        if tags_a & tags_b:
+                            filtered_pairs.add((a, b))
+                before_filter = scope_pairs
+                scope_pairs = len(filtered_pairs)
+                self.logger.debug(
+                    f"[自动合并] scope={scope} BM25候选对={before_filter} → 标签过滤后={scope_pairs}"
+                )
+                pairs = filtered_pairs
+
             if not pairs:
                 self.logger.debug(
                     f"[自动合并] scope={scope} 记忆数={scope_size} BM25候选对=0，跳过"
@@ -1600,32 +1641,59 @@ class MemorySqlManager:
                 groups[root].append(row)
 
             sorted_groups = sorted(groups.values(), key=len, reverse=True)
-            sorted_groups = [g for g in sorted_groups if len(g) >= MIN_CLUSTER_SIZE]
+            sorted_groups = [g for g in sorted_groups if MAX_CLUSTER_SIZE >= len(g) >= MIN_CLUSTER_SIZE]
             sorted_groups = sorted_groups[:MAX_MERGE_GROUPS]
 
             scope_clusters = len(sorted_groups)
             total_clusters += scope_clusters
 
+            # 统计被跳过的超大聚类
+            skipped_oversized = sum(1 for g in groups.values() if len(g) > MAX_CLUSTER_SIZE)
+            if skipped_oversized:
+                self.logger.info(
+                    f"[自动合并] scope={scope} 跳过超大聚类={skipped_oversized}个 (大小>{MAX_CLUSTER_SIZE})"
+                )
+
             self.logger.info(
                 f"[自动合并] scope={scope} 记忆数={scope_size} BM25候选对={scope_pairs} 聚类数={scope_clusters}"
             )
 
-            # 第五步：逐组调用 LLM 合并
-            for cluster in sorted_groups:
+            # 第五步：并行 LLM 调用 + 串行合并写入
+            import asyncio
+            BATCH_SIZE = 3
+
+            sem = asyncio.Semaphore(BATCH_SIZE)
+
+            async def process_cluster(cluster):
+                async with sem:
+                    cluster_size = len(cluster)
+                    preview = str(cluster[0].get("judgment", "") or "")[:40]
+                    try:
+                        merged = await self._llm_merge_cluster(cluster)
+                        return (cluster, merged, preview, cluster_size, None)
+                    except Exception as e:
+                        return (cluster, None, preview, cluster_size, e)
+
+            tasks = [process_cluster(cluster) for cluster in sorted_groups]
+            results = await asyncio.gather(*tasks)
+
+            for cluster, merged, preview, cluster_size, error in results:
                 if merged_total >= MAX_MERGE_GROUPS:
                     break
-                cluster_size = len(cluster)
-                # 取第一条记忆的 judgment 前 40 字作为预览
-                preview = str(cluster[0].get("judgment", "") or "")[:40]
+                if error:
+                    self.logger.warning(
+                        f"[自动合并] scope={scope} 聚类大小={cluster_size} 失败: {error} 预览={preview}",
+                        exc_info=True,
+                    )
+                    continue
+                if merged is None:
+                    skipped_by_llm += 1
+                    self.logger.info(
+                        f"[自动合并] scope={scope} 聚类大小={cluster_size} LLM=skip 预览={preview}"
+                    )
+                    continue
                 try:
                     source_ids = [r["id"] for r in cluster]
-                    merged = await self._llm_merge_cluster(cluster)
-                    if merged is None:
-                        skipped_by_llm += 1
-                        self.logger.info(
-                            f"[自动合并] scope={scope} 聚类大小={cluster_size} LLM=skip 预览={preview}"
-                        )
-                        continue
                     await self.merge_group_with_content(
                         source_ids, merged["judgment"], merged["reasoning"], merged["tags"]
                     )
@@ -1635,17 +1703,60 @@ class MemorySqlManager:
                     )
                 except Exception as e:
                     self.logger.warning(
-                        f"[自动合并] scope={scope} 聚类大小={cluster_size} 失败: {e} 预览={preview}",
+                        f"[自动合并] scope={scope} 聚类大小={cluster_size} 写入失败: {e}",
                         exc_info=True,
                     )
 
         elapsed = int((time.time() - t0) * 1000)
         self._last_auto_merge_at = time.time()
+        # 持久化到 maintenance_state.json，确保重启后不重复全量扫描
+        try:
+            current_state = {}
+            if state_path.exists():
+                with state_path.open("r", encoding="utf-8") as f:
+                    current_state = json.load(f)
+            current_state["auto_merge_last_at"] = time.time()
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            with state_path.open("w", encoding="utf-8") as f:
+                json.dump(current_state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.logger.debug(f"[自动合并] 状态持久化失败: {e}")
+
         self.logger.info(
             f"[自动合并] 完成 合并={merged_total}组 LLM跳过={skipped_by_llm} "
             f"总候选对={total_pairs} 总聚类={total_clusters} 被动记忆={total_passive}条 耗时={elapsed}ms"
         )
         return merged_total
+
+    @staticmethod
+    def _is_person_id(tag: str) -> bool:
+        """判断标签是否为人物标识符（QQ号 或 大写hex用户hash）。"""
+        tag = str(tag or "").strip()
+        if not tag:
+            return False
+        if tag.isdigit() and 5 <= len(tag) <= 15:
+            return True
+        if len(tag) >= 32 and all(c in "0123456789ABCDEF" for c in tag):
+            return True
+        return False
+
+    def _load_tags_for_memory_ids(self, memory_ids: list[str]) -> dict[str, set[str]]:
+        """批量加载记忆对应的标签名集合。返回 {mem_id: {tag1, tag2, ...}}。"""
+        if not memory_ids:
+            return {}
+        placeholders = ",".join(["?" for _ in memory_ids])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT mr.memory_id, gt.name FROM memory_tag_rel mr "
+                f"INNER JOIN global_tags gt ON mr.tag_id = gt.id "
+                f"WHERE mr.memory_id IN ({placeholders})",
+                tuple(memory_ids),
+            ).fetchall()
+        result: dict[str, set[str]] = {}
+        for row in rows:
+            mid = str(row["memory_id"])
+            result.setdefault(mid, set()).add(str(row["name"]))
+        return result
 
     def _get_all_passive_memory_rows(self, since: float = 0.0) -> list[dict]:
         """返回活跃被动记忆行 (id, judgment, memory_scope)。
